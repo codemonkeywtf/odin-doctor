@@ -1,11 +1,11 @@
-package main
+package src
 
 import "core:testing"
 import "core:os"
 import "core:strings"
 
 // Example tests to get the testing habit started.
-// Run with: odin test .
+// Run with: odin test src
 
 @(test)
 test_config_roundtrip :: proc(t: ^testing.T) {
@@ -18,15 +18,16 @@ test_config_roundtrip :: proc(t: ^testing.T) {
 	}
 
 	if !save_config(temp_path, test_config) {
-		testing.error(t, "save_config failed")
+		testing.expect(t, false, "save_config failed")
 		return
 	}
 
 	loaded, ok := load_config(temp_path)
 	if !ok {
-		testing.error(t, "load_config failed")
+		testing.expect(t, false, "load_config failed")
 		return
 	}
+	defer delete(loaded.default_command) // because load clones the value
 
 	testing.expect_value(t, loaded.default_command, test_config.default_command)
 }
@@ -44,5 +45,14 @@ test_config_roundtrip :: proc(t: ^testing.T) {
 // - odin test . will discover and run them.
 // - Keep tests focused on behavior, not implementation details.
 // - For this tool, prioritize tests around config, version checks, and safe file operations (the "don't break the user" parts).
+
+@(test)
+test_that_will_fail :: proc(t: ^testing.T) {
+	// Intentional failure to see what Odin test failures look like.
+	// This is for demonstration / "testing our test" purposes.
+	testing.expect(t, false, "This test is deliberately failing so we can see the failure output format.")
+	// Alternative value mismatch:
+	// testing.expect_value(t, 42, 99)
+}
 
 // Future: black-box tests that build the binary and exec it against temp dirs + copied fixtures.

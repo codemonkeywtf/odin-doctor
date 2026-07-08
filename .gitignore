@@ -1,4 +1,8 @@
-# Odin build artifacts
+# Build and distribution artifacts
+/build/
+/dist/
+
+# Odin build outputs
 *.o
 *.obj
 *.a
@@ -8,17 +12,24 @@
 *.dll
 *.exe
 odin-doctor
-main
 
-# IDE / editor
+# IDE and editor files
 .idea/
 .vscode/
 *.swp
 *~
 
-# OS
+# OS generated files
 .DS_Store
 Thumbs.db
 
-# Test temp (if any left behind)
+# Temporary test files
 temp_test_*
+*.tmp
+
+# User config (example only)
+example.odin-doctor.conf
+
+# AI / Grok session context (per-developer, for catching up other chats)
+GROK_CONTEXT.md
+How_To_Care_and_Feed_Your_AI_Assistant
