@@ -36,3 +36,9 @@ How_To_Care_and_Feed_Your_AI_Assistant
 
 # tools
 */*.prev
+
+# Docker
+.dockerignore
+**/.docker
+*.dockerenv
+docker-compose.override.yml

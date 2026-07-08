@@ -1,0 +1,9 @@
+services:
+  dev:
+    build: .
+    container_name: odin-doctor-dev
+    user: "${UID:-1000}:${GID:-1000}"   # or hardcode if preferred
+    volumes:
+      - .:/workspace/odin-doctor
+    stdin_open: true
+    tty: true
