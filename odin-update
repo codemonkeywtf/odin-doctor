@@ -1,0 +1,505 @@
+#!/bin/bash
+set -euo pipefail
+
+# odin-update — Install or update the Odin compiler from official prebuilts
+# Supports stable (GitHub tagged releases) and nightly (daily builds from odin-lang.org)
+#
+# Designed for curl ... | bash sharing and confident use on Linux and macOS.
+# - Respects $ODIN_ROOT (ODINHOME is legacy, noted but not preferred)
+# - Safe staging + verification before any change to live install
+# - Backup of previous working version + rollback trap on failure (update path only)
+# - First-time install prompts for location (default ~/.local/Odin) when interactive
+# - Creates ~/.config/odin/conf skeleton on first successful install (commented)
+# - Creates symlink ~/.local/bin/odin if ~/.local/bin/ directory already exists
+# - --channel=stable|nightly and --keep=N flags (defaults: stable, 1)
+# - Clear final instructions for current shell + future shells (no auto rc editing
+#   to keep the script simple and safe per project guidelines)
+#
+# Non-obvious decisions documented in comments below.
+# External deps: curl, tar, mktemp, uname, which, jq (only for stable channel;
+#   install with apt/brew/pacman if missing — common for such scripts).
+#
+# Project rules followed: small testable increments, simplicity preferred,
+# Linux/macOS parity, first-time vs update paths clearly separated,
+# self-contained, ask before adding complex logic.
+
+# -------------------------------------------------------------------
+# Defaults (easy to change, used by first-time and flag logic)
+# -------------------------------------------------------------------
+DEFAULT_INSTALL_DIR="${HOME}/.local/Odin"
+CONFIG_DIR="${HOME}/.config/odin"
+CONFIG_FILE="${CONFIG_DIR}/conf"
+KEEP_DEFAULT=1
+CHANNEL_DEFAULT="stable"
+
+# Nightly discovery (lightweight, no extra deps). The page lists dated
+# sections newest-first. We take the first matching filename.
+# If the download base changes, update this or add --nightly-base override later.
+NIGHTLY_DOCS_URL="https://odin-lang.org/docs/nightly/"
+NIGHTLY_DOWNLOAD_BASE="https://odin-lang.org/download/nightly"
+
+# -------------------------------------------------------------------
+# State (kept minimal; set early, read by many functions)
+# -------------------------------------------------------------------
+CHANNEL="$CHANNEL_DEFAULT"
+KEEP="$KEEP_DEFAULT"
+INSTALL_DIR=""
+OS_NAME=""
+ARCH_SUFFIX=""
+IS_FIRST_INSTALL=false
+SUDO_CMD=""          # only set to "sudo" if user explicitly consents for a run
+TEMP_DIR=""
+STAGING_DIR=""
+BACKUP=""
+LATEST=""
+ASSET=""
+URL=""
+
+# For rollback trap (only meaningful on update attempts)
+UPDATE_SUCCEEDED=false
+UPDATE_IN_PROGRESS=false
+
+# Capture original env value before we export anything (for messaging only)
+ORIGINAL_ODIN_ROOT="${ODIN_ROOT:-}"
+
+# -------------------------------------------------------------------
+# Usage / help (kept short and accurate)
+# -------------------------------------------------------------------
+print_usage() {
+    cat <<EOF
+odin-update — install or update Odin (stable or nightly)
+
+Usage: odin-update [--channel=stable|nightly] [--keep=N]
+
+  --channel   stable (default; GitHub tagged dev- releases)
+              nightly (daily builds from odin-lang.org)
+  --keep      number of previous .bak directories to keep (default: 1)
+  -h, --help  this help
+
+First-time: prompts for install dir if run interactively.
+Update: staging + verify + backup + atomic replace + rollback on failure.
+After success: symlink in ~/.local/bin (if dir exists) + config skeleton
+                + clear instructions for PATH/ODIN_ROOT.
+
+Linux and macOS only. Windows users: use the GitHub releases zip directly.
+EOF
+}
+
+# -------------------------------------------------------------------
+# Argument parsing (small, strict, supports both --foo=bar and --foo bar)
+# -------------------------------------------------------------------
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --channel=*) CHANNEL="${1#*=}" ;;
+            --channel)   shift; CHANNEL="${1:-$CHANNEL_DEFAULT}" ;;
+            --keep=*)    KEEP="${1#*=}" ;;
+            --keep)      shift; KEEP="${1:-$KEEP_DEFAULT}" ;;
+            -h|--help)   print_usage; exit 0 ;;
+            *)
+                echo "Error: unknown argument '$1'"
+                print_usage
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    case "$CHANNEL" in
+        stable|nightly) ;;
+        *)
+            echo "Error: --channel must be 'stable' or 'nightly'"
+            exit 1
+            ;;
+    esac
+
+    if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [[ "$KEEP" -lt 0 ]]; then
+        echo "Error: --keep must be a non-negative integer"
+        exit 1
+    fi
+}
+
+# -------------------------------------------------------------------
+# Platform detection (unchanged from proven original — Linux/macOS only)
+# -------------------------------------------------------------------
+detect_platform() {
+    local os_raw arch_raw
+    os_raw=$(uname -s | tr '[:upper:]' '[:lower:]')
+    arch_raw=$(uname -m | tr '[:upper:]' '[:lower:]')
+
+    case "$os_raw" in
+        darwin*) OS_NAME="macos" ;;
+        linux*)  OS_NAME="linux" ;;
+        mingw*|msys*|cygwin*)
+            echo "Windows detected."
+            echo "Please download the Windows zip from:"
+            echo "  https://github.com/odin-lang/Odin/releases/latest"
+            echo "Extract it and add the folder to your PATH."
+            exit 0
+            ;;
+        *)
+            echo "Unsupported OS: $(uname -s)"
+            echo "Supported: Linux and macOS (prebuilts)"
+            exit 1
+            ;;
+    esac
+
+    case "$arch_raw" in
+        x86_64|amd64)  ARCH_SUFFIX="amd64" ;;
+        arm64|aarch64) ARCH_SUFFIX="arm64" ;;
+        *)
+            echo "Unsupported architecture: $arch_raw"
+            exit 1
+            ;;
+    esac
+}
+
+# -------------------------------------------------------------------
+# Portable absolute path (works even if target does not exist yet)
+# -------------------------------------------------------------------
+abs_path() {
+    local p="$1"
+    p="${p/#\~/$HOME}"
+    if [[ "$p" != /* ]]; then
+        p="$(pwd -P)/$p"
+    fi
+    p="${p%/}"
+    echo "$p"
+}
+
+# -------------------------------------------------------------------
+# Determine install location + set IS_FIRST_INSTALL
+# (first-time vs update paths diverge here)
+# -------------------------------------------------------------------
+determine_install_dir() {
+    if [[ -n "${ODIN_ROOT:-}" ]]; then
+        INSTALL_DIR="$ODIN_ROOT"
+    elif [[ -n "${ODINHOME:-}" ]]; then
+        INSTALL_DIR="$ODINHOME"
+        echo "Note: ODINHOME is legacy; prefer ODIN_ROOT."
+    else
+        if which odin >/dev/null 2>&1; then
+            local odin_path
+            odin_path=$(which odin)
+            INSTALL_DIR=$(dirname "$odin_path")
+        else
+            IS_FIRST_INSTALL=true
+            if [[ -t 0 ]]; then
+                echo ""
+                echo "No Odin found via \`which odin\` and no \$ODIN_ROOT set."
+                echo "Performing first-time installation."
+                read -r -p "Install directory [default: $DEFAULT_INSTALL_DIR]: " user_dir
+                INSTALL_DIR="${user_dir:-$DEFAULT_INSTALL_DIR}"
+            else
+                # Non-interactive safe default (curl | bash etc.)
+                INSTALL_DIR="$DEFAULT_INSTALL_DIR"
+            fi
+        fi
+    fi
+
+    INSTALL_DIR=$(abs_path "$INSTALL_DIR")
+
+    if [[ ! -x "$INSTALL_DIR/odin" ]]; then
+        IS_FIRST_INSTALL=true
+    fi
+}
+
+# -------------------------------------------------------------------
+# Early writability check (only for first-time or broken target)
+# -------------------------------------------------------------------
+ensure_writable() {
+    local target="$1"
+    local parent
+    parent=$(dirname "$target")
+
+    if mkdir -p "$parent" 2>/dev/null && [[ -w "$parent" ]]; then
+        return 0
+    fi
+
+    if [[ -t 0 && $EUID -ne 0 ]]; then
+        echo ""
+        echo "⚠️  Cannot create directory: $target"
+        echo "   (Permission denied on parent: $parent)"
+        read -r -p "Use sudo for final install steps? [y/N] " ans
+        if [[ "$ans" =~ ^[Yy] ]]; then
+            if sudo -v; then
+                SUDO_CMD="sudo"
+                echo "   sudo will be used for directory creation and placement."
+                echo "   Ownership will be returned to your user afterwards."
+                return 0
+            else
+                echo "   sudo authentication failed."
+            fi
+        fi
+    fi
+
+    echo ""
+    echo "Please choose a writable location (e.g. ~/.local/Odin),"
+    echo "set ODIN_ROOT, or run with appropriate permissions."
+    exit 1
+}
+
+# -------------------------------------------------------------------
+# Current version (forced ODIN_ROOT protects against stale user env)
+# -------------------------------------------------------------------
+get_current_version() {
+    if [[ -x "$INSTALL_DIR/odin" ]]; then
+        ODIN_ROOT="$INSTALL_DIR" "$INSTALL_DIR/odin" version 2>/dev/null \
+            | head -n1 | awk '{print $NF}'
+    else
+        echo "none"
+    fi
+}
+
+# -------------------------------------------------------------------
+# Release info (stable = GitHub latest + jq; nightly = docs page + grep)
+# This function is the main addition for --channel support.
+# Nightly implementation is lightweight but we document the assumption.
+# -------------------------------------------------------------------
+get_latest_release_info() {
+    if [[ "$CHANNEL" == "stable" ]]; then
+        local json
+        json=$(curl -sL https://api.github.com/repos/odin-lang/Odin/releases/latest)
+        LATEST=$(echo "$json" | jq -r '.tag_name')
+
+        if [[ -z "$LATEST" || "$LATEST" == "null" ]]; then
+            echo "ERROR: Failed to get latest stable tag from GitHub"
+            exit 1
+        fi
+
+        ASSET=$(echo "$json" | jq -r --arg os "$OS_NAME" --arg arch "$ARCH_SUFFIX" '
+            .assets[] |
+            select((.name | test($os; "i")) and (.name | test($arch; "i")) and (.name | test("\\.tar\\.gz$"; "i"))) |
+            .name' | head -1)
+
+        if [[ -z "$ASSET" || "$ASSET" == "null" ]]; then
+            echo "ERROR: No matching ${OS_NAME}-${ARCH_SUFFIX} .tar.gz asset in release $LATEST"
+            echo "Available assets:"
+            echo "$json" | jq -r '.assets[].name' | sed 's/^/  /'
+            exit 1
+        fi
+
+        URL="https://github.com/odin-lang/Odin/releases/download/${LATEST}/${ASSET}"
+
+    else
+        # Nightly path — small and isolated so we can test/fix independently
+        # Assumption: page has newest #### date section first, and filenames
+        # are consistently "odin-OS-ARCH-nightly+YYYY-MM-DD.tar.gz"
+        local page
+        page=$(curl -sL "$NIGHTLY_DOCS_URL")
+
+        ASSET=$(echo "$page" | grep -oE 'odin-'"$OS_NAME"'-'"$ARCH_SUFFIX"'-nightly\+[0-9-]+\.tar\.gz' | head -1)
+
+        if [[ -z "$ASSET" ]]; then
+            echo "ERROR: Could not find a nightly asset for ${OS_NAME}-${ARCH_SUFFIX}"
+            echo "Check $NIGHTLY_DOCS_URL manually. The page structure may have changed."
+            echo "If needed we can add a --nightly-url override or simplify."
+            exit 1
+        fi
+
+        # Derive a readable tag (the date part)
+        local date_part
+        date_part=$(echo "$ASSET" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
+        LATEST="nightly+$date_part"
+        URL="${NIGHTLY_DOWNLOAD_BASE}/${ASSET}"
+
+        # Non-obvious: we still do full staging + verify even for nightly,
+        # because a bad daily tarball is still possible.
+    fi
+
+    echo "Latest ($CHANNEL): $LATEST"
+    echo "Asset: $ASSET"
+}
+
+# -------------------------------------------------------------------
+# (Stubs for remaining logic — will be filled in next small increment)
+# These keep the file runnable and testable right now.
+# -------------------------------------------------------------------
+
+download_and_stage() {
+    echo "[increment 2 TODO] download + staging + tar validation would happen here"
+    # TEMP_DIR=$(mktemp -d)
+    # ... curl, tar -tzf check, extract to STAGING_DIR, chmod +x
+}
+
+verify_staged() {
+    echo "[increment 2 TODO] verify staged odin version would happen here"
+}
+
+backup_current() {
+    if [[ "$IS_FIRST_INSTALL" != true && -x "$INSTALL_DIR/odin" ]]; then
+        BACKUP="${INSTALL_DIR}.bak.$(date +%Y%m%d-%H%M)"
+        echo "[increment 2] Would backup to $BACKUP (KEEP=$KEEP)"
+        # actual mv under SUDO_CMD if set
+    fi
+}
+
+commit_and_smoke() {
+    echo "[increment 2 TODO] atomic mv of staging -> INSTALL_DIR + final smoke test"
+}
+
+create_symlink() {
+    local bin_dir="$HOME/.local/bin"
+    if [[ -d "$bin_dir" ]]; then
+        ln -sf "$INSTALL_DIR/odin" "$bin_dir/odin" 2>/dev/null || true
+        echo "Symlink created at $bin_dir/odin (if ~/.local/bin is in your PATH this helps)"
+    fi
+}
+
+create_config_skeleton() {
+    if [[ "$IS_FIRST_INSTALL" == true ]]; then
+        mkdir -p "$CONFIG_DIR"
+        if [[ ! -f "$CONFIG_FILE" ]]; then
+            cat > "$CONFIG_FILE" <<'EOF'
+# Odin configuration (created by odin-update on first successful install)
+# This is a skeleton for future tools (odin-doctor etc.). Safe to edit.
+
+# CHANNEL=stable          # or nightly
+# ODIN_ROOT=/path/to/your/Odin
+
+# Add other options below as the ecosystem grows.
+EOF
+            echo "Created config skeleton: $CONFIG_FILE"
+        fi
+    fi
+}
+
+prune_old_backups() {
+    # Simple prune driven by --keep (default 1)
+    local count=$((KEEP + 1))
+    if [[ -n "$SUDO_CMD" ]]; then
+        $SUDO_CMD ls -1dt "${INSTALL_DIR}".bak.* 2>/dev/null | tail -n +$count | $SUDO_CMD xargs rm -rf -- 2>/dev/null || true
+    else
+        ls -1dt "${INSTALL_DIR}".bak.* 2>/dev/null | tail -n +$count | xargs rm -rf -- 2>/dev/null || true
+    fi
+}
+
+print_success_and_instructions() {
+    export ODIN_ROOT="$INSTALL_DIR"
+    export PATH="$INSTALL_DIR:$PATH"
+    hash -r 2>/dev/null || true
+
+    local ver at
+    ver=$(ODIN_ROOT="$INSTALL_DIR" odin version 2>/dev/null | head -n1 | awk '{print $NF}' || echo "unknown")
+    at=$(which odin 2>/dev/null || echo "$INSTALL_DIR/odin")
+
+    if [[ "$IS_FIRST_INSTALL" == true ]]; then
+        echo "✅ odin version $ver installed at $at"
+    else
+        echo "✅ Updated to odin version $ver at $at"
+    fi
+
+    create_symlink
+    create_config_skeleton
+    prune_old_backups
+
+    echo ""
+    echo "Odin is available in the current shell (we exported ODIN_ROOT and PATH)."
+    echo ""
+    echo "For new shells / future terminals, add these two lines to your rc file"
+    echo "(~/.zshrc, ~/.bashrc, ~/.config/fish/config.fish, or equivalent) then source it:"
+    echo ""
+    if [[ "$RC_FILE" == *"fish"* ]]; then
+        echo "    set -gx ODIN_ROOT \"$INSTALL_DIR\""
+        echo "    set -gx PATH \"\$ODIN_ROOT\" \$PATH"
+    else
+        echo "    export ODIN_ROOT=\"$INSTALL_DIR\""
+        echo "    export PATH=\"\$ODIN_ROOT:\$PATH\""
+    fi
+    echo ""
+    echo "Then run: source <your-rc-file>   or just open a new terminal / log out and back in."
+    echo "Verify anytime with: which odin && odin version"
+}
+
+# -------------------------------------------------------------------
+# Rollback trap (kept from original — only active on UPDATE_IN_PROGRESS)
+# -------------------------------------------------------------------
+cleanup_and_rollback() {
+    rm -rf "$TEMP_DIR" 2>/dev/null || true
+
+    if [[ "$UPDATE_SUCCEEDED" == true || "$UPDATE_IN_PROGRESS" != true ]]; then
+        return 0
+    fi
+
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  ODIN INSTALL/UPDATE FAILED — attempting graceful recovery ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+
+    if [[ "$IS_FIRST_INSTALL" == true && -d "$INSTALL_DIR" && ! -x "$INSTALL_DIR/odin" ]]; then
+        echo "Cleaning up partial first-time install at $INSTALL_DIR ..."
+        if [[ -n "$SUDO_CMD" ]]; then
+            $SUDO_CMD rm -rf "$INSTALL_DIR" 2>/dev/null || true
+        else
+            rm -rf "$INSTALL_DIR" 2>/dev/null || true
+        fi
+    fi
+
+    if [[ -n "$BACKUP" && -d "$BACKUP" && ! -x "$INSTALL_DIR/odin" ]]; then
+        echo "Restoring previous working version from $BACKUP ..."
+        if [[ -n "$SUDO_CMD" ]]; then
+            $SUDO_CMD rm -rf "$INSTALL_DIR" 2>/dev/null || true
+            $SUDO_CMD mv "$BACKUP" "$INSTALL_DIR" 2>/dev/null || true
+        else
+            rm -rf "$INSTALL_DIR" 2>/dev/null || true
+            mv "$BACKUP" "$INSTALL_DIR" 2>/dev/null || true
+        fi
+        local restored
+        restored=$(ODIN_ROOT="$INSTALL_DIR" "$INSTALL_DIR/odin" version 2>/dev/null | head -n1 | awk '{print $NF}' || echo "restored")
+        echo "Rollback complete. Current version: $restored"
+    fi
+}
+trap cleanup_and_rollback EXIT
+
+# -------------------------------------------------------------------
+# Main (orchestrates the small, testable pieces)
+# -------------------------------------------------------------------
+main() {
+    parse_args "$@"
+    detect_platform
+    determine_install_dir
+
+    # Early writability for first-time / broken targets
+    if [[ "$IS_FIRST_INSTALL" == true ]]; then
+        ensure_writable "$INSTALL_DIR"
+    fi
+
+    echo "=== Odin Installer & Updater ==="
+    echo "Target: $INSTALL_DIR ($OS_NAME $ARCH_SUFFIX)"
+    echo "Channel: $CHANNEL   Keep previous backups: $KEEP"
+
+    local current
+    current=$(get_current_version)
+    if [[ "$current" != "none" ]]; then
+        echo "Current: $current"
+    else
+        echo "No working Odin binary at target — first-time installation."
+    fi
+
+    get_latest_release_info
+
+    # Version comparison note: Odin dev- tags often report internally with
+    # "-nightly:commit" even on the "stable" channel. This is an Odin-lang
+    # behavior, not a bug in this script. --channel=nightly gives you the
+    # freshest daily tarball from the website.
+    if [[ "$current" == *"$LATEST"* || "$current" == *"$ASSET"* ]]; then
+        UPDATE_SUCCEEDED=true
+        echo "✅ Already up to date!"
+        exit 0
+    fi
+
+    # From this point we may mutate the filesystem — enable rollback path
+    UPDATE_IN_PROGRESS=true
+
+    # The following are still TODO in this increment (small step)
+    download_and_stage
+    verify_staged
+    backup_current
+    commit_and_smoke
+
+    # Success path (will be reached after increment 2 fills the TODOs)
+    UPDATE_SUCCEEDED=true
+    print_success_and_instructions
+}
+
+main "$@"

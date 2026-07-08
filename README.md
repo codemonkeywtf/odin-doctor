@@ -14,16 +14,26 @@ odin-doctor aims to be the reliable way to install, update, diagnose, and mainta
 
 ## Current Status
 
-Early alpha / perpetual beta stage.
+Early alpha / perpetual beta stage (see versioning below).
 
-**Versioning**: Simple scheme — 0.1 through 0.9, then 0.10, 0.11, ... We only consider 1.0 once all open issues have been cleared and remained clear for a sustained period.
+**Directory structure (best practices)**:
+- `src/` — all source code (modular, not a single monolith).
+- `odin-doctor.odin` — thin root entry point so `odin run . -file` / `odin run .` works naturally.
+- `testdata/`, `scripts/`, `build/`, `dist/` — standard for a well-developed CLI tool.
+- Tests live alongside the code they test (in `src/`) using Odin's `*_test.odin` + `odin test src` convention.
 
-We're starting implementation by "playing with Odin":
-- Local version check vs. latest from GitHub releases.
-- File I/O (starting with a simple `~/.config/odin-doctor/odin-doctor.conf`).
-- Basic tests using Odin's built-in `odin test` + `core:testing`.
+We're starting small with Odin:
+- Local vs. online version checking stub.
+- File I/O for the user config file.
+- Basic tests.
+- The robust shell integration logic (with test fixtures) from the original bash version will be ported incrementally.
 
-See the GitHub Issues (labeled with `kanban:*`) for the full backlog of Q&A and features. We move one focused item at a time.
+See the GitHub Issues (with `kanban:*` labels) for the backlog. We discuss and implement one focused item at a time.
+
+## Versioning
+
+0.1 → 0.9, then 0.10, 0.11, ...  
+We stay in perpetual beta until the issue list is empty *and* has stayed empty for a while. Only then do we consider 1.0.
 
 ## Config
 
