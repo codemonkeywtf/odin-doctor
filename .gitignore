@@ -33,3 +33,6 @@ example.odin-doctor.conf
 # AI / Grok session context (per-developer, for catching up other chats)
 GROK_CONTEXT.md
 How_To_Care_and_Feed_Your_AI_Assistant
+
+# tools
+*/*.prev
