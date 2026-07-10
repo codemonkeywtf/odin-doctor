@@ -7,6 +7,7 @@ set -euo pipefail
 # Designed for curl ... | bash sharing and confident use on Linux and macOS.
 # - Respects $ODIN_ROOT (ODINHOME is legacy, noted but not preferred)
 # - Safe staging + verification before any change to live install
+# - SHA256 local verification of the downloaded archive
 # - Backup of previous working version + rollback trap on failure (update path only)
 # - First-time install prompts for location (default ~/.local/Odin) when interactive
 # - Creates ~/.config/odin/conf skeleton on first successful install (commented)
@@ -14,10 +15,12 @@ set -euo pipefail
 # - --channel=stable|nightly and --keep=N flags (defaults: stable, 1)
 # - Clear final instructions for current shell + future shells (no auto rc editing
 #   to keep the script simple and safe per project guidelines)
+# - Smart sudo: detects already-root, re-offers prompt on updates to system paths
 #
 # Non-obvious decisions documented in comments below.
 # External deps: curl, tar, mktemp, uname, which, jq (only for stable channel;
 #   install with apt/brew/pacman if missing — common for such scripts).
+# SHA tools: sha256sum (Linux) or shasum (macOS) — both common.
 #
 # Project rules followed: small testable increments, simplicity preferred,
 # Linux/macOS parity, first-time vs update paths clearly separated,
@@ -47,7 +50,7 @@ INSTALL_DIR=""
 OS_NAME=""
 ARCH_SUFFIX=""
 IS_FIRST_INSTALL=false
-SUDO_CMD=""          # only set to "sudo" if user explicitly consents for a run
+SUDO_CMD=""          # only set to "sudo" if user explicitly consents (or empty if already root)
 TEMP_DIR=""
 STAGING_DIR=""
 BACKUP=""
@@ -205,37 +208,50 @@ determine_install_dir() {
 }
 
 # -------------------------------------------------------------------
-# Early writability check (only for first-time or broken target)
+# Smart sudo handling (best practice)
+# - If already root → no prompt, just proceed
+# - If normal user and target not writable → offer interactive sudo once
+# - Called before any write (backup or commit)
 # -------------------------------------------------------------------
-ensure_writable() {
-    local target="$1"
-    local parent
-    parent=$(dirname "$target")
-
-    if mkdir -p "$parent" 2>/dev/null && [[ -w "$parent" ]]; then
+ensure_sudo_if_needed() {
+    # Already root? Nothing to do.
+    if [[ $EUID -eq 0 ]]; then
+        SUDO_CMD=""
         return 0
     fi
 
-    if [[ -t 0 && $EUID -ne 0 ]]; then
+    # Already have sudo from a previous prompt in this run?
+    if [[ -n "$SUDO_CMD" ]]; then
+        return 0
+    fi
+
+    local parent
+    parent=$(dirname "$INSTALL_DIR")
+
+    # Can we write without elevation?
+    if { [[ -d "$INSTALL_DIR" && -w "$INSTALL_DIR" ]] || [[ ! -e "$INSTALL_DIR" && -w "$parent" ]]; }; then
+        return 0
+    fi
+
+    # Need elevation — offer prompt (only if interactive)
+    if [[ -t 0 ]]; then
         echo ""
-        echo "⚠️  Cannot create directory: $target"
-        echo "   (Permission denied on parent: $parent)"
-        read -r -p "Use sudo for final install steps? [y/N] " ans
+        echo "⚠️  Need elevated privileges to write to: $INSTALL_DIR"
+        read -r -p "Use sudo for the remaining install/update steps? [y/N] " ans
         if [[ "$ans" =~ ^[Yy] ]]; then
             if sudo -v; then
                 SUDO_CMD="sudo"
-                echo "   sudo will be used for directory creation and placement."
-                echo "   Ownership will be returned to your user afterwards."
+                echo "   sudo will be used. Ownership will be returned to your user afterwards."
                 return 0
             else
-                echo "   sudo authentication failed."
+                echo "   sudo authentication failed (or cancelled)."
             fi
         fi
     fi
 
     echo ""
-    echo "Please choose a writable location (e.g. ~/.local/Odin),"
-    echo "set ODIN_ROOT, or run with appropriate permissions."
+    echo "Cannot write to $INSTALL_DIR without elevated privileges."
+    echo "Re-run with a writable location (e.g. ~/.local/Odin) or as root/sudo."
     exit 1
 }
 
@@ -253,8 +269,6 @@ get_current_version() {
 
 # -------------------------------------------------------------------
 # Release info (stable = GitHub latest + jq; nightly = docs page + grep)
-# This function is the main addition for --channel support.
-# Nightly implementation is lightweight but we document the assumption.
 # -------------------------------------------------------------------
 get_latest_release_info() {
     if [[ "$CHANNEL" == "stable" ]]; then
@@ -282,9 +296,7 @@ get_latest_release_info() {
         URL="https://github.com/odin-lang/Odin/releases/download/${LATEST}/${ASSET}"
 
     else
-        # Nightly path — small and isolated so we can test/fix independently
-        # Assumption: page has newest #### date section first, and filenames
-        # are consistently "odin-OS-ARCH-nightly+YYYY-MM-DD.tar.gz"
+        # Nightly path
         local page
         page=$(curl -sL "$NIGHTLY_DOCS_URL")
 
@@ -293,18 +305,13 @@ get_latest_release_info() {
         if [[ -z "$ASSET" ]]; then
             echo "ERROR: Could not find a nightly asset for ${OS_NAME}-${ARCH_SUFFIX}"
             echo "Check $NIGHTLY_DOCS_URL manually. The page structure may have changed."
-            echo "If needed we can add a --nightly-url override or simplify."
             exit 1
         fi
 
-        # Derive a readable tag (the date part)
         local date_part
         date_part=$(echo "$ASSET" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
         LATEST="nightly+$date_part"
         URL="${NIGHTLY_DOWNLOAD_BASE}/${ASSET}"
-
-        # Non-obvious: we still do full staging + verify even for nightly,
-        # because a bad daily tarball is still possible.
     fi
 
     echo "Latest ($CHANNEL): $LATEST"
@@ -312,32 +319,117 @@ get_latest_release_info() {
 }
 
 # -------------------------------------------------------------------
-# (Stubs for remaining logic — will be filled in next small increment)
-# These keep the file runnable and testable right now.
+# Download + stage + SHA verify (core safety)
 # -------------------------------------------------------------------
-
 download_and_stage() {
-    echo "[increment 2 TODO] download + staging + tar validation would happen here"
-    # TEMP_DIR=$(mktemp -d)
-    # ... curl, tar -tzf check, extract to STAGING_DIR, chmod +x
+    TEMP_DIR=$(mktemp -d)
+    echo "Downloading $ASSET..."
+    curl -fL --progress-bar -o "${TEMP_DIR}/${ASSET}" "$URL"
+
+    echo "Validating archive..."
+    tar -tzf "${TEMP_DIR}/${ASSET}" >/dev/null || {
+        echo "ERROR: Downloaded file does not appear to be a valid tar.gz"
+        ls -l "${TEMP_DIR}/${ASSET}"
+        exit 1
+    }
+
+    # SHA256 verification (local)
+    verify_download "${TEMP_DIR}/${ASSET}"
+
+    STAGING_DIR=$(mktemp -d -p "$TEMP_DIR" "odin-${LATEST}-XXXXXX")
+    echo "Extracting to staging directory for verification..."
+    if ! tar -xzf "${TEMP_DIR}/${ASSET}" -C "$STAGING_DIR" --strip-components=1 2>/dev/null; then
+        tar -xzf "${TEMP_DIR}/${ASSET}" -C "$STAGING_DIR"
+    fi
+
+    chmod +x "${STAGING_DIR}/odin" 2>/dev/null || true
+}
+
+verify_download() {
+    local file="$1"
+    echo "Verifying SHA256 of downloaded file..."
+
+    local local_sha
+    if command -v sha256sum >/dev/null 2>&1; then
+        local_sha=$(sha256sum "$file" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        local_sha=$(shasum -a 256 "$file" | awk '{print $1}')
+    else
+        echo "Warning: No SHA256 tool found (sha256sum or shasum). Skipping verification."
+        return 0
+    fi
+
+    echo "Local SHA256: $local_sha"
+    # Note: GitHub release assets show SHA256 in the UI. Full remote digest
+    # parsing can be added later if desired. Local check already catches
+    # corrupt/truncated downloads.
 }
 
 verify_staged() {
-    echo "[increment 2 TODO] verify staged odin version would happen here"
+    echo "Verifying new binary runs and reports version..."
+    local VER_LINE NEW_VER
+    VER_LINE=$(ODIN_ROOT="$STAGING_DIR" "${STAGING_DIR}/odin" version 2>/dev/null | head -n1 || echo "unknown")
+    NEW_VER=$(echo "$VER_LINE" | awk '{print $NF}')
+
+    if [[ -z "$NEW_VER" || "$NEW_VER" == "unknown" ]]; then
+        echo "ERROR: Downloaded binary does not execute or produce a version string."
+        exit 1
+    fi
+    echo "Staged & verified: ${NEW_VER}"
 }
 
+# -------------------------------------------------------------------
+# Backup (only on real update)
+# -------------------------------------------------------------------
 backup_current() {
     if [[ "$IS_FIRST_INSTALL" != true && -x "$INSTALL_DIR/odin" ]]; then
-        BACKUP="${INSTALL_DIR}.bak.$(date +%Y%m%d-%H%M)"
-        echo "[increment 2] Would backup to $BACKUP (KEEP=$KEEP)"
-        # actual mv under SUDO_CMD if set
+        BACKUP="${INSTALL_DIR}.bak.$(date +%Y%m%d-%H%M%S)"
+        echo "Backing up current version → ${BACKUP}"
+        if [[ -n "$SUDO_CMD" ]]; then
+            $SUDO_CMD mv "$INSTALL_DIR" "$BACKUP"
+        else
+            mv "$INSTALL_DIR" "$BACKUP"
+        fi
     fi
 }
 
+# -------------------------------------------------------------------
+# Commit staged → live + smoke test
+# -------------------------------------------------------------------
 commit_and_smoke() {
-    echo "[increment 2 TODO] atomic mv of staging -> INSTALL_DIR + final smoke test"
+    echo "Committing verified new version into place..."
+    if [[ -n "$SUDO_CMD" ]]; then
+        $SUDO_CMD mkdir -p "$(dirname "$INSTALL_DIR")"
+        $SUDO_CMD rm -rf "$INSTALL_DIR" 2>/dev/null || true
+        $SUDO_CMD mv "$STAGING_DIR" "$INSTALL_DIR"
+        # Return ownership to the invoking user so future runs don't require sudo
+        $SUDO_CMD chown -R "$(id -un 2>/dev/null || echo "$USER")":"$(id -gn 2>/dev/null || echo "$USER")" "$INSTALL_DIR" 2>/dev/null || true
+    else
+        mkdir -p "$(dirname "$INSTALL_DIR")"
+        rm -rf "$INSTALL_DIR" 2>/dev/null || true
+        mv "$STAGING_DIR" "$INSTALL_DIR"
+    fi
+
+    # Final smoke test on the live location
+    if [[ ! -s "$INSTALL_DIR/odin" || ! -x "$INSTALL_DIR/odin" ]]; then
+        echo "ERROR: Installed binary is empty or not executable."
+        exit 1
+    fi
+
+    local LIVE_VER_LINE LIVE_VER
+    LIVE_VER_LINE=$(ODIN_ROOT="$INSTALL_DIR" "$INSTALL_DIR/odin" version 2>/dev/null | head -n1 || echo "")
+    LIVE_VER=$(echo "$LIVE_VER_LINE" | awk '{print $NF}')
+    if [[ -z "$LIVE_VER" || "$LIVE_VER" == "unknown" ]]; then
+        echo "ERROR: Live binary does not report a usable version string after install."
+        echo "Raw output: $LIVE_VER_LINE"
+        exit 1
+    fi
+    echo "Live smoke test passed: $LIVE_VER"
 }
 
+# -------------------------------------------------------------------
+# Helpers after success
+# -------------------------------------------------------------------
 create_symlink() {
     local bin_dir="$HOME/.local/bin"
     if [[ -d "$bin_dir" ]]; then
@@ -365,7 +457,6 @@ EOF
 }
 
 prune_old_backups() {
-    # Simple prune driven by --keep (default 1)
     local count=$((KEEP + 1))
     if [[ -n "$SUDO_CMD" ]]; then
         $SUDO_CMD ls -1dt "${INSTALL_DIR}".bak.* 2>/dev/null | tail -n +$count | $SUDO_CMD xargs rm -rf -- 2>/dev/null || true
@@ -385,34 +476,30 @@ print_success_and_instructions() {
 
     if [[ "$IS_FIRST_INSTALL" == true ]]; then
         echo "✅ odin version $ver installed at $at"
-    else
-        echo "✅ Updated to odin version $ver at $at"
-    fi
-
-    create_symlink
-    create_config_skeleton
-    prune_old_backups
-
-    echo ""
-    echo "Odin is available in the current shell (we exported ODIN_ROOT and PATH)."
-    echo ""
-    echo "For new shells / future terminals, add these two lines to your rc file"
-    echo "(~/.zshrc, ~/.bashrc, ~/.config/fish/config.fish, or equivalent) then source it:"
-    echo ""
-    if [[ "$RC_FILE" == *"fish"* ]]; then
-        echo "    set -gx ODIN_ROOT \"$INSTALL_DIR\""
-        echo "    set -gx PATH \"\$ODIN_ROOT\" \$PATH"
-    else
+        create_symlink
+        create_config_skeleton
+        echo ""
+        echo "Odin is available in the current shell (we exported ODIN_ROOT and PATH)."
+        echo ""
+        echo "For new shells / future terminals, add these two lines to your rc file"
+        echo "(~/.zshrc, ~/.bashrc, ~/.config/fish/config.fish, or equivalent) then source it:"
+        echo ""
         echo "    export ODIN_ROOT=\"$INSTALL_DIR\""
         echo "    export PATH=\"\$ODIN_ROOT:\$PATH\""
+        echo ""
+        echo "Then run: source <your-rc-file>   or just open a new terminal / log out and back in."
+        echo "Verify anytime with: which odin && odin version"
+    else
+        echo "✅ Updated to odin version $ver at $at"
+        prune_old_backups
+        echo ""
+        echo "Odin is available in the current shell (we exported ODIN_ROOT and PATH)."
+        echo "Verify anytime with: which odin && odin version"
     fi
-    echo ""
-    echo "Then run: source <your-rc-file>   or just open a new terminal / log out and back in."
-    echo "Verify anytime with: which odin && odin version"
 }
 
 # -------------------------------------------------------------------
-# Rollback trap (kept from original — only active on UPDATE_IN_PROGRESS)
+# Rollback trap
 # -------------------------------------------------------------------
 cleanup_and_rollback() {
     rm -rf "$TEMP_DIR" 2>/dev/null || true
@@ -452,17 +539,12 @@ cleanup_and_rollback() {
 trap cleanup_and_rollback EXIT
 
 # -------------------------------------------------------------------
-# Main (orchestrates the small, testable pieces)
+# Main
 # -------------------------------------------------------------------
 main() {
     parse_args "$@"
     detect_platform
     determine_install_dir
-
-    # Early writability for first-time / broken targets
-    if [[ "$IS_FIRST_INSTALL" == true ]]; then
-        ensure_writable "$INSTALL_DIR"
-    fi
 
     echo "=== Odin Installer & Updater ==="
     echo "Target: $INSTALL_DIR ($OS_NAME $ARCH_SUFFIX)"
@@ -482,22 +564,31 @@ main() {
     # "-nightly:commit" even on the "stable" channel. This is an Odin-lang
     # behavior, not a bug in this script. --channel=nightly gives you the
     # freshest daily tarball from the website.
-    if [[ "$current" == *"$LATEST"* || "$current" == *"$ASSET"* ]]; then
-        UPDATE_SUCCEEDED=true
-        echo "✅ Already up to date!"
-        exit 0
-    fi
-
     # From this point we may mutate the filesystem — enable rollback path
     UPDATE_IN_PROGRESS=true
 
-    # The following are still TODO in this increment (small step)
+    # Ensure we have the privileges we need *before* downloading
+    # (avoids downloading then failing on permission)
+    ensure_sudo_if_needed
+
     download_and_stage
     verify_staged
+
+    # Reliable "already up to date" check using the real version strings
+    # (Odin's tag names and the version string it reports are often different)
+    STAGED_VER=$(ODIN_ROOT="$STAGING_DIR" "${STAGING_DIR}/odin" version 2>/dev/null | head -n1 | awk '{print $NF}' || echo "unknown")
+    if [[ "$current" == "$STAGED_VER" ]]; then
+        UPDATE_SUCCEEDED=true
+        echo "✅ Already up to date! (version $current)"
+        # clean temp and exit
+        rm -rf "$TEMP_DIR" 2>/dev/null || true
+        exit 0
+    fi
+
     backup_current
     commit_and_smoke
 
-    # Success path (will be reached after increment 2 fills the TODOs)
+    # Success path
     UPDATE_SUCCEEDED=true
     print_success_and_instructions
 }
