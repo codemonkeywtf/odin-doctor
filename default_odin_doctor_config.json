@@ -1,0 +1,24 @@
+{
+  "_comments": {
+    "intro": "Default configuration for odin-doctor.",
+    "usage": "Copy or move this file to ~/.config/odin/doctor/config.json",
+    "notes": [
+      "The app will automatically create this file with defaults if it does not exist.",
+      "CLI flags will override any values in user_config.",
+      "This structure separates documentation from actual settings for readability."
+    ],
+    "channel": "stable | nightly",
+    "keep": "number of previous backups to retain (default 1)",
+    "install_dir": "empty = auto-detect using ODIN_ROOT or 'which odin'",
+    "temp_dir": "empty = use system temp directory (mktemp)",
+    "prefer_system_install": "if true, prefer system locations like /opt/Odin"
+  },
+
+  "user_config": {
+    "channel": "stable",
+    "keep": 1,
+    "install_dir": "",
+    "temp_dir": "",
+    "prefer_system_install": false
+  }
+}
