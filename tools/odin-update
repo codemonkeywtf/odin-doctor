@@ -31,7 +31,9 @@ set -euo pipefail
 # -------------------------------------------------------------------
 DEFAULT_INSTALL_DIR="${HOME}/.local/Odin"
 CONFIG_DIR="${HOME}/.config/odin"
-CONFIG_FILE="${CONFIG_DIR}/conf"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+SCRIPT_DIR="$(cd '$(dirname "${BASH_SOURCE[0]}")' && pwd)"
+DEFAULT_CONFIG_FILE="$SCRIPT_DIR/default_odin_doctor_config.json" # in project root when developing
 KEEP_DEFAULT=1
 CHANNEL_DEFAULT="stable"
 
@@ -175,6 +177,11 @@ abs_path() {
 # (first-time vs update paths diverge here)
 # -------------------------------------------------------------------
 determine_install_dir() {
+    # Respect config file if install_dir was set there and not overridden by env
+    if [[ -z "${ODIN_ROOT:-}" && -z "${ODINHOME:-}" && -n "$CONFIG_INSTALL_DIR" ]]; then
+        INSTALL_DIR="$CONFIG_INSTALL_DIR"
+    fi
+
     if [[ -n "${ODIN_ROOT:-}" ]]; then
         INSTALL_DIR="$ODIN_ROOT"
     elif [[ -n "${ODINHOME:-}" ]]; then
@@ -253,6 +260,129 @@ ensure_sudo_if_needed() {
     echo "Cannot write to $INSTALL_DIR without elevated privileges."
     echo "Re-run with a writable location (e.g. ~/.local/Odin) or as root/sudo."
     exit 1
+}
+
+# -------------------------------------------------------------------
+# Config handling (new JSON format at ~/.config/odin/doctor/config.json)
+# -------------------------------------------------------------------
+detect_existing_odin_install() {
+    # Check environment variable first
+    if [[ -n "${ODIN_ROOT:-}" && -x "${ODIN_ROOT}/odin" ]]; then
+        echo "$ODIN_ROOT"
+        return 0
+    fi
+
+    # Check which odin
+    if command -v odin >/dev/null 2>&1; then
+        local odin_path
+        odin_path=$(which odin)
+        local install_dir
+        install_dir=$(dirname "$odin_path")
+        if [[ -x "$install_dir/odin" ]]; then
+            echo "$install_dir"
+            return 0
+        fi
+    fi
+
+    # Common locations (Linux/macOS)
+    for path in /opt/Odin ~/.local/Odin "$HOME/Odin" "$HOME/.local/share/odin"; do
+        if [[ -x "$path/odin" ]]; then
+            echo "$path"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+load_or_create_config() {
+    mkdir -p "$CONFIG_DIR"
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "No config file found. Creating default at $CONFIG_FILE"
+
+        local existing_install=""
+        existing_install=$(detect_existing_odin_install || true)
+
+        if [[ -n "$existing_install" ]]; then
+            echo "Detected existing Odin installation at: $existing_install"
+            echo "Creating config with this location pre-filled."
+        else
+            echo "No existing Odin installation detected."
+            echo "A default config will be created."
+            echo "If you already have Odin installed elsewhere, edit the config to avoid conflicts."
+        fi
+
+        # Create from project default if available, otherwise inline
+        if [[ -f "$DEFAULT_CONFIG_FILE" ]]; then
+            cp "$DEFAULT_CONFIG_FILE" "$CONFIG_FILE"
+        else
+            cat > "$CONFIG_FILE" <<'EOF'
+{
+  "_comments": {
+    "intro": "Default configuration for odin-doctor.",
+    "usage": "Copy or move this file to ~/.config/odin/doctor/config.json",
+    "notes": [
+      "The app will automatically create this file with defaults if it does not exist.",
+      "CLI flags override values here."
+    ]
+  },
+  "user_config": {
+    "channel": "stable",
+    "keep": 1,
+    "install_dir": "",
+    "temp_dir": "",
+    "prefer_system_install": false
+  }
+}
+EOF
+        fi
+
+        echo ""
+        echo "⚠️  Please review/edit the config file if needed:"
+        echo "    $CONFIG_FILE"
+        echo ""
+        read -r -p "Press Enter to continue (or Ctrl+C to cancel)..." _
+    fi
+
+    # Load values using jq (graceful fallback if jq missing)
+    if command -v jq >/dev/null 2>&1 && [[ -f "$CONFIG_FILE" ]]; then
+        CHANNEL=$(jq -r '.user_config.channel // "stable"' "$CONFIG_FILE")
+        KEEP=$(jq -r '.user_config.keep // 1' "$CONFIG_FILE")
+        CONFIG_INSTALL_DIR=$(jq -r '.user_config.install_dir // ""' "$CONFIG_FILE")
+        CONFIG_TEMP_DIR=$(jq -r '.user_config.temp_dir // ""' "$CONFIG_FILE")
+        PREFER_SYSTEM_INSTALL=$(jq -r '.user_config.prefer_system_install // false' "$CONFIG_FILE")
+    else
+        echo "Warning: jq not found or config unreadable — using hard-coded defaults."
+        CHANNEL="stable"
+        KEEP=1
+        CONFIG_INSTALL_DIR=""
+        CONFIG_TEMP_DIR=""
+        PREFER_SYSTEM_INSTALL=false
+    fi
+}
+
+confirm_before_changes() {
+    echo ""
+    echo "=== Planned Action Summary ==="
+    echo "Target install directory : $INSTALL_DIR"
+    echo "Channel                  : $CHANNEL"
+    echo "Keep previous backups    : $KEEP"
+    echo ""
+
+    if [[ "$IS_FIRST_INSTALL" == true ]]; then
+        echo "This will perform a **first-time installation** of Odin."
+    else
+        echo "This will **update** your existing Odin installation."
+        echo "A timestamped backup will be created automatically."
+    fi
+
+    echo ""
+    read -r -p "Proceed with the above? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Operation cancelled by user. No changes made."
+        exit 0
+    fi
 }
 
 # -------------------------------------------------------------------
@@ -438,24 +568,6 @@ create_symlink() {
     fi
 }
 
-create_config_skeleton() {
-    if [[ "$IS_FIRST_INSTALL" == true ]]; then
-        mkdir -p "$CONFIG_DIR"
-        if [[ ! -f "$CONFIG_FILE" ]]; then
-            cat > "$CONFIG_FILE" <<'EOF'
-# Odin configuration (created by odin-update on first successful install)
-# This is a skeleton for future tools (odin-doctor etc.). Safe to edit.
-
-# CHANNEL=stable          # or nightly
-# ODIN_ROOT=/path/to/your/Odin
-
-# Add other options below as the ecosystem grows.
-EOF
-            echo "Created config skeleton: $CONFIG_FILE"
-        fi
-    fi
-}
-
 prune_old_backups() {
     local count=$((KEEP + 1))
     if [[ -n "$SUDO_CMD" ]]; then
@@ -477,7 +589,6 @@ print_success_and_instructions() {
     if [[ "$IS_FIRST_INSTALL" == true ]]; then
         echo "✅ odin version $ver installed at $at"
         create_symlink
-        create_config_skeleton
         echo ""
         echo "Odin is available in the current shell (we exported ODIN_ROOT and PATH)."
         echo ""
