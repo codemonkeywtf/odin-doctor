@@ -32,7 +32,7 @@ set -euo pipefail
 DEFAULT_INSTALL_DIR="${HOME}/.local/Odin"
 CONFIG_DIR="${HOME}/.config/odin"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
-SCRIPT_DIR="$(cd '$(dirname "${BASH_SOURCE[0]}")' && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_CONFIG_FILE="$SCRIPT_DIR/default_odin_doctor_config.json" # in project root when developing
 KEEP_DEFAULT=1
 CHANNEL_DEFAULT="stable"
@@ -178,8 +178,8 @@ abs_path() {
 # -------------------------------------------------------------------
 determine_install_dir() {
     # Respect config file if install_dir was set there and not overridden by env
-    if [[ -z "${ODIN_ROOT:-}" && -z "${ODINHOME:-}" && -n "$CONFIG_INSTALL_DIR" ]]; then
-        INSTALL_DIR="$CONFIG_INSTALL_DIR"
+    if [[ -z "${ODIN_ROOT:-}" && -z "${ODINHOME:-}" && -n "$CONFIG_DIR" ]]; then
+        INSTALL_DIR="$CONFIG_DIR"
     fi
 
     if [[ -n "${ODIN_ROOT:-}" ]]; then
@@ -655,6 +655,7 @@ trap cleanup_and_rollback EXIT
 main() {
     parse_args "$@"
     detect_platform
+    load_or_create_config
     determine_install_dir
 
     echo "=== Odin Installer & Updater ==="
@@ -676,6 +677,9 @@ main() {
     # behavior, not a bug in this script. --channel=nightly gives you the
     # freshest daily tarball from the website.
     # From this point we may mutate the filesystem — enable rollback path
+
+    confirm_before_changes
+
     UPDATE_IN_PROGRESS=true
 
     # Ensure we have the privileges we need *before* downloading
